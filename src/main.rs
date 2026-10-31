@@ -41,7 +41,8 @@ impl Motor {
 
     pub fn read(&mut self, _data: &[u8; 8]) {
         // TODO: decode angle, speed and current as the manual describes.
-        todo!("Decode motor feedback");
+        let angle_raw =((_data[0] as u16) << 8) | (_data[1] as u16);
+        let angle_rad = (angle_raw as f32) * (2.0 * core::f32::consts::PI / 8192.0);
     }
 }
 
@@ -163,9 +164,38 @@ impl Control {
         while let Ok(received) = receiver.try_receive() {
             match received {
                 Ok(envelope) => {
-                    // TODO: check the ID and length, pass the data to the matching axis's
+                    // TODO: check the ID and length, pass the data to the matching axis's ✔
                     // `Motor::read`, and record its feedback age.
                     let _frame = envelope.frame;
+
+                    if let embassy_stm32::can::Id::Standard(id) = _frame.id(){
+                        let id = id.as_u16();
+                        let data = _frame.data();
+
+                        if data.len() >= 8 {
+                            let mut buf = [0u8; 8];
+                            buf.copy_from_slice(&data[..8]);
+
+                            // pitch motor id is (  ) and yaw motor id is (   ), need to check
+                            match id{
+                                // yaw
+                                0x201 => {
+                                    self.yaw.motor.read(&buf);
+                                }
+
+                                // pitch
+                                0x202 => {
+                                    self.pitch.motor.read(&buf);
+                                }
+
+                                _ => {
+                                    // Unknown ID, ignore or log
+                                }
+                            }
+
+                        }
+
+                    }
                 }
                 Err(error) => dm_mc02::log_can_error(error),
             }
