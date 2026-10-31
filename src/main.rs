@@ -42,7 +42,12 @@ impl Motor {
     pub fn read(&mut self, _data: &[u8; 8]) {
         // TODO: decode angle, speed and current as the manual describes.
         let angle_raw =((_data[0] as u16) << 8) | (_data[1] as u16);
-        let angle_rad = (angle_raw as f32) * (2.0 * core::f32::consts::PI / 8192.0);
+        self.angle_rad = (angle_raw as f32) * (2.0 * core::f32::consts::PI / 8192.0); //单圈rad
+        
+        let speed_raw = (((_data[2] as u16) << 8) | (_data[3] as u16)) as i16;
+        self.speed_rpm = speed_raw as f32;
+        
+        self.current_raw = (((_data[4] as u16) << 8) | (_data[5] as u16)) as i16; //协议原始值
     }
 }
 
@@ -166,35 +171,25 @@ impl Control {
                 Ok(envelope) => {
                     // TODO: check the ID and length, pass the data to the matching axis's ✔
                     // `Motor::read`, and record its feedback age.
-                    let _frame = envelope.frame;
+                    let frame = envelope.frame;
+                    
+                    let id = match frame.id() {
+                        embedded_can::Id::Standard(std_id) => std_id.as_raw(),
+                        _ => continue,
+                    };
+                    let data = frame.data();
 
-                    if let embassy_stm32::can::Id::Standard(id) = _frame.id(){
-                        let id = id.as_u16();
-                        let data = _frame.data();
+                    if data.len() < 8 {
+                        continue;
+                    }
 
-                        if data.len() >= 8 {
-                            let mut buf = [0u8; 8];
-                            buf.copy_from_slice(&data[..8]);
+                    let mut buf = [0u8; 8];
+                    buf.copy_from_slice(&data[..8]);
 
-                            // pitch motor id is (  ) and yaw motor id is (   ), need to check
-                            match id{
-                                // yaw
-                                0x201 => {
-                                    self.yaw.motor.read(&buf);
-                                }
-
-                                // pitch
-                                0x202 => {
-                                    self.pitch.motor.read(&buf);
-                                }
-
-                                _ => {
-                                    // Unknown ID, ignore or log
-                                }
-                            }
-
-                        }
-
+                    match id {
+                        0x205 => self.yaw.motor.read(&buf),
+                        0x206 => self.pitch.motor.read(&buf),
+                        _ => {}
                     }
                 }
                 Err(error) => dm_mc02::log_can_error(error),
