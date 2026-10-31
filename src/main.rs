@@ -41,12 +41,13 @@ impl Motor {
 
     pub fn read(&mut self, _data: &[u8; 8]) {
         // TODO: decode angle, speed and current as the manual describes.
+        //angle
         let angle_raw =((_data[0] as u16) << 8) | (_data[1] as u16);
         self.angle_rad = (angle_raw as f32) * (2.0 * core::f32::consts::PI / 8192.0); //单圈rad
-        
+        //rotation speed
         let speed_raw = (((_data[2] as u16) << 8) | (_data[3] as u16)) as i16;
         self.speed_rpm = speed_raw as f32;
-        
+        //current
         self.current_raw = (((_data[4] as u16) << 8) | (_data[5] as u16)) as i16; //协议原始值
     }
 }
@@ -169,7 +170,7 @@ impl Control {
         while let Ok(received) = receiver.try_receive() {
             match received {
                 Ok(envelope) => {
-                    // TODO: check the ID and length, pass the data to the matching axis's ✔
+                    // TODO: check the ID and length, pass the data to the matching axis's 
                     // `Motor::read`, and record its feedback age.
                     let frame = envelope.frame;
                     
@@ -225,9 +226,26 @@ impl Control {
     /// cleared command reaches the motor within 1 ms. A full queue drops the frame and
     /// counts it in `TX_FAILED`.
     pub fn transmit(&mut self, can: &mut Can1) {
-        let data = [0u8; 8];
+        let mut data = [0u8; 8];
         // TODO: limit and convert each axis's `command_current_a`, and write it into the
         // bytes for its motor ID as the manual describes. Other motor IDs stay zero.
+
+        const MAX_CURRENT_A: f32 = 3.0;
+
+        //yaw
+        let yaw_current = self.yaw.motor.command_current_a.clamp(-MAX_CURRENT_A, MAX_CURRENT_A);
+        let yaw_current_raw = (yaw_current / MAX_CURRENT_A * 16384.0) as i16;
+        let yaw_bytes = yaw_current_raw.to_be_bytes();
+        data[0] = yaw_bytes[0];
+        data[1] = yaw_bytes[1];
+
+        //pitch
+        let pitch_current = self.pitch.motor.command_current_a.clamp(-MAX_CURRENT_A, MAX_CURRENT_A);
+        let pitch_current_raw = (pitch_current / MAX_CURRENT_A * 16384.0) as i16;
+        let pitch_bytes = pitch_current_raw.to_be_bytes(); 
+        data[2] = pitch_bytes[0];
+        data[3] = pitch_bytes[1];
+
         let frame = Frame::new_standard(MOTOR_COMMAND_ID, &data).unwrap();
         if can.writer().try_write(frame).is_err() {
             TX_FAILED.fetch_add(1, Ordering::Relaxed);
