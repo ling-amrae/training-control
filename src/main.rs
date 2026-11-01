@@ -54,22 +54,55 @@ impl Motor {
 
 /// PID gains, plus the integral and history kept between ticks.
 // TODO: add gains, history, an integral limit and a symmetric output limit `maxout`.
-#[derive(Default)]
-pub struct Pid {}
+pub struct Pid {
+    pub kp: f32,
+    pub ki: f32,
+    pub kd: f32,
+    pub integral: f32,
+    pub previous_error: f32,
+    pub integral_limit: f32,
+    pub max_output: f32,
+}
+
+impl Default for Pid {
+    fn default() -> Self {
+        Self {
+            kp: 0.0,
+            ki: 0.0,
+            kd: 0.0,
+            integral: 0.0,
+            previous_error: 0.0,
+            integral_limit: 0.0,
+            max_output: 0.0,
+        }
+    }
+}
 
 impl Pid {
     // TODO: clear the integral and history.
-    pub fn reset(&mut self) {
-        todo!("Clear PID history");
+    pub fn reset(&mut self) { 
+        self.integral = 0.0;
+        self.previous_error = 0.0;
     }
 
     /// `target` and `measured` share a unit, set by the caller. The position loop takes rad
     /// and returns rpm; the speed loop takes rpm and returns A. `dt_s` is in seconds.
     /// If a position loop returns rad/s, convert it to rpm before passing it to the speed loop.
-    pub fn calculate(&mut self, _target: f32, _measured: f32, _dt_s: f32) -> f32 {
+    pub fn calculate(&mut self, target: f32, measured: f32, dt_s: f32) -> f32 {
         // TODO: compute the PID with dt_s, and limit the integral and output.
-        todo!("Implement PID");
-    }
+        let error = target - measured;
+        //limit integral
+        self.integral += error * dt_s;
+        self.integral = self.integral.clamp(-self.integral_limit, self.integral_limit);
+
+        //PID
+        let p = self.kp * error;
+        let i = self.ki * self.integral;
+        let d = self.kd * (error - self.previous_error) / dt_s;
+        self.previous_error = error;
+        let pid_output = (p + i + d).clamp(-self.max_output, self.max_output);
+        pid_output
+    }  
 }
 
 /// The gimbal's stage, which decides the allowed operations and outputs.
@@ -220,7 +253,37 @@ impl Control {
     /// Set targets for the current state, run each axis's PIDs and write the current commands.
     // TODO: limited recentering in Prepare, remote cascade control in Running, and
     // `disable_all` in Waiting and Error. Each tick is 0.001 s.
-    pub fn update(&mut self) {}
+    
+    pub fn read_remote_input(&mut self) {
+        // 放在 Control 的方法中；先读取输入，不在这里直接写电压输出。
+        if let Some(remote) = self.remote {
+            let yaw_input = remote.channels[2] as f32 / 660.0;
+            let pitch_input = remote.channels[3] as f32 / 660.0;
+            let left_switch = remote.left_switch;
+            let right_switch = remote.right_switch;
+            // 接下来由你实现死区、方向、目标更新和状态判断。
+            
+            ket y_in = yaw_input;
+            
+
+            
+        }
+    }
+    
+    pub fn update(&mut self) {                
+
+        // yaw position loop and speed loop
+        let yaw_rpm = self.yaw.position_pid.calculate(self.yaw.target_angle_rad, self.yaw.motor.angle_rad, 0.001);
+        self.yaw.target_rpm = yaw_rpm;
+        let yaw_current = self.yaw.speed_pid.calculate(self.yaw.target_rpm, self.yaw.motor.speed_rpm, 0.001);
+        self.yaw.motor.command_current_a = yaw_current;
+
+        // pitch position loop and speed loop
+        let pitch_rpm = self.pitch.position_pid.calculate(self.pitch.target_angle_rad, self.pitch.motor.angle_rad, 0.001);
+        self.pitch.target_rpm = pitch_rpm;
+        let pitch_current = self.pitch.speed_pid.calculate(self.pitch.target_rpm, self.pitch.motor.speed_rpm, 0.001);
+        self.pitch.motor.command_current_a = pitch_current;
+    }
 
     /// Queue one group command frame on CAN1 without waiting. This runs every tick, so a
     /// cleared command reaches the motor within 1 ms. A full queue drops the frame and
