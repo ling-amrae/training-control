@@ -15,6 +15,7 @@ const MOTOR_COMMAND_ID: u16 = 0x1FF;
 // Ticks without remote input before it counts as lost.
 const REMOTE_SILENT_TICKS: u16 = 100;
 const TICK: Duration = Duration::from_millis(1);
+const MAX_VOLTAGE_RAW: f32 = 10000.0; //【调试】电压最高输出
 
 /// Command frames dropped because the CAN transmit queue was full, for example while no
 /// motor acknowledges frames.
@@ -39,15 +40,15 @@ impl Motor {
         self.command_voltage_raw = 0.0;
     }
 
-    pub fn read(&mut self, _data: &[u8; 8]) {
+    pub fn read(&mut self, data: &[u8; 8]) {
         //angle
-        let angle_raw =((_data[0] as u16) << 8) | (_data[1] as u16);
+        let angle_raw =((data[0] as u16) << 8) | (data[1] as u16);
         self.angle_rad = (angle_raw as f32) * (2.0 * core::f32::consts::PI / 8192.0); //单圈rad
         //rotation speed
-        let speed_raw = (((_data[2] as u16) << 8) | (_data[3] as u16)) as i16;
+        let speed_raw = (((data[2] as u16) << 8) | (data[3] as u16)) as i16;
         self.speed_rpm = speed_raw as f32;
         //current
-        self.current_raw = (((_data[4] as u16) << 8) | (_data[5] as u16)) as i16; //协议原始值
+        self.current_raw = (((data[4] as u16) << 8) | (data[5] as u16)) as i16; //协议原始值
     }
 }
 
@@ -89,22 +90,32 @@ impl Pid {
     /// and returns rpm; the speed loop takes rpm and returns A. `dt_s` is in seconds.
     /// If a position loop returns rad/s, convert it to rpm before passing it to the speed loop.
     pub fn calculate(&mut self, target: f32, measured: f32, dt_s: f32) -> f32 {
-        let error = target - measured;
+        self.calculate_from_error(target - measured, dt_s)
+    }
+
+    pub fn calculate_from_error(&mut self, error: f32, dt_s: f32) -> f32 {
         //limit integral
-        self.integral += error * dt_s;
-        self.integral = self.integral.clamp(-self.integral_limit, self.integral_limit);
+        let i = if self.ki != 0.0 {
+            self.integral += error * dt_s;
+            self.integral = self.integral.clamp(-self.integral_limit, self.integral_limit);
+            self.ki * self.integral
+        } else {
+            self.integral = 0.0;
+            0.0
+        };
 
         //PID
         let p = self.kp * error;
-        let i = self.ki * self.integral;
         let d = if self.first_run {
             self.first_run = false;
+            self.previous_error = error;
             0.0
         } else {
-            self.kd * (error - self.previous_error) / dt_s
+            let d_val = self.kd * (error - self.previous_error) / dt_s;
+            self.previous_error = error;
+            d_val
         };
 
-        self.previous_error = error;
         (p + i + d).clamp(-self.max_output, self.max_output)
     }  
 }
@@ -140,6 +151,8 @@ pub struct Axis {
     //电机物理零位
     pub reference_angle_rad: f32, 
     pub max_position_rpm: f32, // rad/s
+    pub max_target_rate_rad_s: f32,
+    pub rc_deadband: f32,
     
     // 故障检测：疑似堵转
     pub stall_ticks: u16,
@@ -175,6 +188,8 @@ impl Default for Control {
         let mut yaw = Axis::default();
         yaw.reference_angle_rad = 0.0; // 【调试】yaw零位 正前方
         yaw.max_position_rpm = 100.0;  // 默认位置环输出限幅，速度环目标最大 100 rpm
+        yaw.max_target_rate_rad_s = 2.0;
+        yaw.rc_deadband = 0.05;
         
         yaw.position_pid.kp = 10.0;
         yaw.position_pid.max_output = 100.0; // 对应 max_position_rpm
@@ -188,6 +203,8 @@ impl Default for Control {
         let mut pitch = Axis::default();
         pitch.reference_angle_rad = 0.0; // 【调试】pitch零位 水平
         pitch.max_position_rpm = 100.0;
+        pitch.max_target_rate_rad_s = 2.0;
+        pitch.rc_deadband = 0.05;
         
         pitch.position_pid.kp = 10.0;
         pitch.position_pid.max_output = 100.0;
@@ -294,7 +311,7 @@ impl Control {
                         }
                         _ => {}
                     }
-                } // 这里少了闭合括号，导致报错
+                }
                 Err(error) => dm_mc02::log_can_error(error),
             }
         }
@@ -406,21 +423,28 @@ impl Control {
             let mut yaw_input = (remote.channels[2] as f32 - 1024.0) / 660.0; //【调试】如果方向反了乘-1
             let mut pitch_input = (remote.channels[3] as f32 - 1024.0) / 660.0; //【调试】如果方向反了乘-1
             
-            if yaw_input.abs() < 0.05 { yaw_input = 0.0; }
-            if pitch_input.abs() < 0.05 { pitch_input = 0.0; }
+            yaw_input = yaw_input.clamp(-1.0, 1.0);
+            pitch_input = pitch_input.clamp(-1.0, 1.0);
 
-            const MAX_RATE: f32 = 2.0; // rad/s，最大目标角速度
+            if yaw_input.abs() < self.yaw.rc_deadband { yaw_input = 0.0; }
+            if pitch_input.abs() < self.pitch.rc_deadband { pitch_input = 0.0; }
+
             let dt = 0.001; // 1 ms tick
             
-            self.yaw.target_angle_rad += yaw_input * MAX_RATE * dt; 
-            self.pitch.target_angle_rad += pitch_input * MAX_RATE * dt; 
+            self.yaw.target_angle_rad += yaw_input * self.yaw.max_target_rate_rad_s * dt; 
+            self.pitch.target_angle_rad += pitch_input * self.pitch.max_target_rate_rad_s * dt; 
             
             // 限制pitch角度范围 rad
             self.pitch.target_angle_rad = self.pitch.target_angle_rad.clamp(-0.785, 0.785); 
             
             //yaw 0~2π回绕
             let two_pi = 2.0 * core::f32::consts::PI;
-            self.yaw.target_angle_rad = (self.yaw.target_angle_rad + two_pi) % two_pi;
+            
+            if self.yaw.target_angle_rad >= two_pi {
+                self.yaw.target_angle_rad -= two_pi;
+            } else if self.yaw.target_angle_rad < 0.0 {
+                self.yaw.target_angle_rad += two_pi;
+            }
         }
     }
     
@@ -437,10 +461,9 @@ impl Control {
         // --- yaw 双环控制 ---
         // 1. 计算最短路径误差并进行回绕处理
         let yaw_err = Self::wrap_angle(self.yaw.target_angle_rad - self.yaw.motor.angle_rad);
-        let yaw_measured_adj = self.yaw.target_angle_rad - yaw_err; 
         
-        // 2. 位置环：输入 rad，输出 rpm
-        let yaw_rpm = self.yaw.position_pid.calculate(self.yaw.target_angle_rad, yaw_measured_adj, 0.001);
+        // 2. 位置环：输入 rad 误差，输出 rpm
+        let yaw_rpm = self.yaw.position_pid.calculate_from_error(yaw_err, 0.001);
         self.yaw.target_rpm = yaw_rpm.clamp(-self.yaw.max_position_rpm, self.yaw.max_position_rpm);
         
         // 3. 速度环：输入 rpm，输出 电压原始值
@@ -449,9 +472,8 @@ impl Control {
 
         // --- pitch 双环控制 ---
         let pitch_err = Self::wrap_angle(self.pitch.target_angle_rad - self.pitch.motor.angle_rad);
-        let pitch_measured_adj = self.pitch.target_angle_rad - pitch_err;
         
-        let pitch_rpm = self.pitch.position_pid.calculate(self.pitch.target_angle_rad, pitch_measured_adj, 0.001);
+        let pitch_rpm = self.pitch.position_pid.calculate_from_error(pitch_err, 0.001);
         self.pitch.target_rpm = pitch_rpm.clamp(-self.pitch.max_position_rpm, self.pitch.max_position_rpm);
         
         let pitch_voltage = self.pitch.speed_pid.calculate(self.pitch.target_rpm, self.pitch.motor.speed_rpm, 0.001);
@@ -474,18 +496,14 @@ impl Control {
     /// counts it in `TX_FAILED`.
     pub fn transmit(&mut self, can: &mut Can1) {
         let mut data = [0u8; 8];
-        
-        const MAX_VOLTAGE_RAW: f32 = 10000.0; //【调试】电压最高输出
 
         // yaw
-        // 【修复】转换成 i16，并修正变量名
         let yaw_raw = self.yaw.motor.command_voltage_raw.clamp(-MAX_VOLTAGE_RAW, MAX_VOLTAGE_RAW) as i16;
         let yaw_bytes = yaw_raw.to_be_bytes();
         data[0] = yaw_bytes[0];
         data[1] = yaw_bytes[1];
 
         // pitch
-        // 【修复】转换成 i16，并修正变量名
         let pitch_raw = self.pitch.motor.command_voltage_raw.clamp(-MAX_VOLTAGE_RAW, MAX_VOLTAGE_RAW) as i16;
         let pitch_bytes = pitch_raw.to_be_bytes();
         data[2] = pitch_bytes[0];
@@ -513,10 +531,19 @@ impl Control {
 
     /// 检查单个轴的状态，返回触发的原因（如果发生故障）
     fn check_axis_faults(axis: &mut Axis) -> Option<&'static str> {
+        const STALL_TARGET_RPM: f32 = 50.0;
+        const STALL_OUTPUT: f32 = 2000.0;
+        const STALL_ACTUAL_RPM: f32 = 10.0;
+        const STALL_TIMEOUT_TICKS: u16 = 500;
+
+        const OSC_WINDOW_TICKS: u16 = 200;
+        const OSC_MIN_AMPLITUDE_RAD: f32 = 0.1;
+        const OSC_MAX_FREQ_HZ: f32 = 30.0;
+
         // 1. 疑似堵转检测 (500ms)
-        let is_stalling = axis.target_rpm.abs() > 50.0 
-            && axis.motor.command_voltage_raw.abs() > 2000.0 
-            && axis.motor.speed_rpm.abs() < 10.0;
+        let is_stalling = axis.target_rpm.abs() > STALL_TARGET_RPM 
+            && axis.motor.command_voltage_raw.abs() > STALL_OUTPUT 
+            && axis.motor.speed_rpm.abs() < STALL_ACTUAL_RPM;
 
         if is_stalling {
             axis.stall_ticks = axis.stall_ticks.saturating_add(1);
@@ -524,7 +551,7 @@ impl Control {
             axis.stall_ticks = 0; // 只要条件不满足，立刻清零重新计时
         }
 
-        if axis.stall_ticks > 500 {
+        if axis.stall_ticks > STALL_TIMEOUT_TICKS {
             return Some("Stall");
         }
 
@@ -534,7 +561,7 @@ impl Control {
         let err = Control::wrap_angle(axis.target_angle_rad - axis.motor.angle_rad);
         
         // 振幅需大于 0.1 rad 的噪声容限才认为是“振荡”而非“稳定在目标附近”
-        let current_sign = if err.abs() > 0.1 {
+        let current_sign = if err.abs() > OSC_MIN_AMPLITUDE_RAD {
             if err > 0.0 { 1 } else { -1 }
         } else {
             0
@@ -549,14 +576,16 @@ impl Control {
             axis.last_oscillation_sign = 0;
         }
 
-        if axis.oscillation_ticks >= 200 {
-            let is_oscillating = axis.oscillation_periods > 15;
+        if axis.oscillation_ticks >= OSC_WINDOW_TICKS {
+            let full_periods = axis.oscillation_periods as f32 / 2.0;
+            let window_sec = OSC_WINDOW_TICKS as f32 / 1000.0;
+            let freq_hz = full_periods / window_sec;
             
             // 无论是否触发，结算后都要清零窗口
             axis.oscillation_periods = 0;
             axis.oscillation_ticks = 0;
             
-            if is_oscillating {
+            if freq_hz > OSC_MAX_FREQ_HZ {
                 return Some("Oscillation");
             }
         }
