@@ -11,7 +11,7 @@ use embassy_stm32::can::Frame;
 use embassy_time::{Duration, Instant, Ticker};
 
 // GM6020 current-mode group command for motor IDs 1 to 4.
-const MOTOR_COMMAND_ID: u16 = 0x1FE;
+const MOTOR_COMMAND_ID: u16 = 0x1FF;
 // Ticks without remote input before it counts as lost.
 const REMOTE_SILENT_TICKS: u16 = 100;
 const TICK: Duration = Duration::from_millis(1);
@@ -142,6 +142,9 @@ pub struct Control {
     pub pitch: Axis,
     pub remote: Option<dm_mc02::Dr16>,
     pub remote_silent_ticks: u16,
+    pub last_right_switch: u8,
+    pub yaw_feedback_age: u16,   
+    pub pitch_feedback_age: u16, 
 }
 
 /// Start in `Waiting` with no remote input.
@@ -154,6 +157,9 @@ impl Default for Control {
             pitch: Axis::default(),
             remote: None,
             remote_silent_ticks: REMOTE_SILENT_TICKS,
+            last_right_switch: 0,
+            yaw_feedback_age: 9999,
+            pitch_feedback_age: 9999,
         }
     }
 }
@@ -168,6 +174,9 @@ impl Control {
     /// Runs every 1 ms: read the remote and motor feedback, update the state, then
     /// compute and send the outputs. Missing remote input forces `Waiting`.
     pub fn tick(&mut self, can: &mut Can1) {
+        self.yaw.feedback_age = self.yaw.feedback_age.saturating_add(1);
+        self.pitch.feedback_age = self.pitch.feedback_age.saturating_add(1);
+        
         self.read_remote();
         self.read_feedback(can);
         self.update_mode();
@@ -211,8 +220,8 @@ impl Control {
                         embedded_can::Id::Standard(std_id) => std_id.as_raw(),
                         _ => continue,
                     };
+                    
                     let data = frame.data();
-
                     if data.len() < 8 {
                         continue;
                     }
@@ -221,8 +230,14 @@ impl Control {
                     buf.copy_from_slice(&data[..8]);
 
                     match id {
-                        0x205 => self.yaw.motor.read(&buf),
-                        0x206 => self.pitch.motor.read(&buf),
+                        0x205 => {
+                            self.yaw.motor.read(&buf);
+                            self.yaw.feedback_age = 0;
+                        }
+                        0x206 => {
+                            self.pitch.motor.read(&buf);
+                            self.pitch.feedback_age = 0;
+                        }
                         _ => {}
                     }
                 }
@@ -237,17 +252,41 @@ impl Control {
         match self.state {
             State::Waiting => {
                 // TODO: enter Prepare after valid feedback and a new enable request.
+                // 进入准备状态：初始化目标和 PID
+                self.yaw.position_pid.reset();
+                self.yaw.speed_pid.reset();
+                self.pitch.position_pid.reset();
+                self.pitch.speed_pid.reset();
+                    
+                // 先暂时把目标设为当前角度，防止乱飞
+                // （以后标定了机械零位，这里改成 0.0）
+                self.yaw.target_angle_rad = self.yaw.motor.angle_rad;
+                self.pitch.target_angle_rad = self.pitch.motor.angle_rad;
+                self.state = State::Prepare;
+                }
             }
             State::Prepare => {
                 // TODO: enter Running once recentering settles; stop on a timeout or fault.
+                // TODO: 以后在这里做真正的回正。
+                // 现在为了测试，只要拨杆还在中位，就直接进 Running
+                if self.right_switch == 3 {
+                    self.state = State::Running;
+                } else if self.right_switch == 2 {
+                    self.state = State::Waiting;
+                }
             }
             State::Running => {
                 // TODO: handle disable, feedback timeouts and control faults.
+                if self.right_switch == 2 || self.right_switch == 1 {
+                    self.state = State::Waiting;
+                }
             }
             State::Error => {
                 // TODO: keep zero output until your manual recovery condition.
             }
         }
+
+        self.last_right_switch = self.right_switch;
     }
 
     /// Set targets for the current state, run each axis's PIDs and write the current commands.
@@ -259,18 +298,46 @@ impl Control {
         if let Some(remote) = self.remote {
             let yaw_input = remote.channels[2] as f32 / 660.0;
             let pitch_input = remote.channels[3] as f32 / 660.0;
-            let left_switch = remote.left_switch;
-            let right_switch = remote.right_switch;
+            let _left_switch = remote.left_switch;
+            let _right_switch = remote.right_switch;
             // 接下来由你实现死区、方向、目标更新和状态判断。
             
-            ket y_in = yaw_input;
-            
+            let mut y_in = yaw_input;
+            if y_in.abs() < 0.05 {
+                y_in = 0.0;
+            }
+            let mut p_in = pitch_input;
+            if p_in.abs() < 0.05 {
+                p_in = 0.0;
+            }
 
-            
-        }
+            const MAX_RATE: f32 = 2.0; // rad/s
+            self.yaw.target_angle_rad += y_in * MAX_RATE * 0.001; // 根据实际情况调角度
+            self.pitch.target_angle_rad += p_in * MAX_RATE * 0.001; //
+
+            self.pitch.target_angle_rad = self.pitch.target_angle_rad.clamp(-0.785, 0.785); // 限制俯仰角度范围 rad
+            // yaw 限位看实际情况
+
+            //switches
+            let feedback_ok = self.yaw_feedback_age < 50 && self.pitch_feedback_age < 50;
+            if feedback_ok && self.last_right_switch == 2 && self.right_switch == 3 {
+                self.state = State::Prepare;
+            } else if self.right_switch == 2 {
+                self.state = State::Waiting;
+            }
     }
     
     pub fn update(&mut self) {                
+        if self.state == State::Waiting || self.state == State::Error {
+            self.disable_all();
+            return;
+        }
+
+        if self.state == State::Running {
+            self.read_remote_input(); 
+        } else if self.state == State::Prepare {
+        }
+
 
         // yaw position loop and speed loop
         let yaw_rpm = self.yaw.position_pid.calculate(self.yaw.target_angle_rad, self.yaw.motor.angle_rad, 0.001);
