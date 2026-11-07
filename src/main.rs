@@ -283,6 +283,8 @@ impl Control {
         while let Ok(received) = receiver.try_receive() {
             match received {
                 Ok(envelope) => {
+                    // TODO: check the ID and length, pass the data to the matching axis's
+                    // `Motor::read`, and record its feedback age.
                     let frame = envelope.frame;
                     
                     let id = match frame.id() {
@@ -319,39 +321,43 @@ impl Control {
 
     /// Choose the state from the remote, feedback and fault conditions.
     pub fn update_mode(&mut self) {
+        //读拨杆
         let right_sw = self.remote.as_ref().map_or(0, |r| r.right_switch);
         let left_sw = self.remote.as_ref().map_or(0, |r| r.left_switch);
         
+        //如果状态新鲜
         let feedback_ok = self.yaw_feedback_age < 50 && self.pitch_feedback_age < 50;
 
         match self.state {
             State::Waiting => {
-                // 【修复】必须要有明确的启动动作（上次下拨2，这次中拨3），不能直接进
+                // enable后进waiting，启动动作（先下拨2，再中拨3），回正以及重置
                 if feedback_ok && self.last_right_switch == 2 && right_sw == 3 {
+                    //目标角度设置为物理零位
                     self.yaw.target_angle_rad = self.yaw.reference_angle_rad;
                     self.pitch.target_angle_rad = self.pitch.reference_angle_rad;                
-                    
+                    //全部重置
                     self.yaw.position_pid.reset();
                     self.yaw.speed_pid.reset();
                     self.pitch.position_pid.reset();
                     self.pitch.speed_pid.reset();
                     self.prepare_timeout_ticks = 0;
                     self.prepare_settle_ticks = 0;
-
+                    //进prepare
                     self.state = State::Prepare;
                     rtt_target::rprintln!("State -> Prepare (Recentering)");
                 }
             }
 
             State::Prepare => {
+                //如果右拨杆下拨，回到waiting
                 if right_sw == 2 {
                     self.state = State::Waiting;
                     rtt_target::rprintln!("State -> Waiting (Disabled in Prepare)");
-                } else if self.check_faults() {
+                } else if self.check_faults() { //堵转或者高频振荡进error
                     self.state = State::Error;
-                } else {
+                } else { //右拨杆在3，没有故障，开始计时
                     self.prepare_timeout_ticks += 1;
-                    if self.prepare_timeout_ticks > 3000 {
+                    if self.prepare_timeout_ticks > 3000 { // 3秒超时进error
                         self.state = State::Error;
                         rtt_target::rprintln!("Error: Prepare timeout!");
                     } else {
@@ -361,10 +367,10 @@ impl Control {
                         let yaw_stable = yaw_err < 0.05 && self.yaw.motor.speed_rpm.abs() < 10.0;
                         let pitch_stable = pitch_err < 0.05 && self.pitch.motor.speed_rpm.abs() < 10.0;
                             
-                        if yaw_stable && pitch_stable {
+                        if yaw_stable && pitch_stable { //两个都稳定
                             self.prepare_settle_ticks += 1;
                             if self.prepare_settle_ticks > 200 { // 稳定 200ms
-                                self.state = State::Running;
+                                self.state = State::Running; //进running
                                 rtt_target::rprintln!("State -> Running");
                             }
                         } else {
@@ -375,12 +381,12 @@ impl Control {
             }
 
             State::Running => {
-                if right_sw == 2 {
+                if right_sw == 2 { // 右拨杆下拨，进waiting
                     self.state = State::Waiting;
                     rtt_target::rprintln!("State -> Waiting (Disabled in Running)");
-                } else if self.check_faults() {
+                } else if self.check_faults() { //堵转或者高频振荡进error
                     self.state = State::Error;
-                } else if !feedback_ok {
+                } else if !feedback_ok { //反馈丢失，进waiting
                     self.state = State::Waiting;
                     rtt_target::rprintln!("State -> Waiting (Feedback lost)");
                 }
@@ -389,6 +395,7 @@ impl Control {
             State::Error => {
                 // 恢复动作：左拨杆先下拨(2)再上拨(1)
                 if self.last_left_switch == 2 && left_sw == 1 {
+                    // 恢复动作触发后，重置目标角度和速度环目标
                     self.yaw.target_angle_rad = self.yaw.motor.angle_rad;
                     self.pitch.target_angle_rad = self.pitch.motor.angle_rad;
                     self.yaw.target_rpm = 0.0;
@@ -403,9 +410,8 @@ impl Control {
                     self.yaw.oscillation_periods = 0;
                     self.pitch.oscillation_periods = 0;
                     
-                    self.state = State::Running;
-                    rtt_target::rprintln!("Manual Recovery -> Running (yaw={:.3}, pitch={:.3})", 
-                        self.yaw.motor.angle_rad, self.pitch.motor.angle_rad);
+                    self.state = State::Waiting;
+                    rtt_target::rprintln!("Manual Recovery -> Waiting (Please re-enable)");
                 }
             }
         }
@@ -426,6 +432,7 @@ impl Control {
             yaw_input = yaw_input.clamp(-1.0, 1.0);
             pitch_input = pitch_input.clamp(-1.0, 1.0);
 
+            //死区
             if yaw_input.abs() < self.yaw.rc_deadband { yaw_input = 0.0; }
             if pitch_input.abs() < self.pitch.rc_deadband { pitch_input = 0.0; }
 
@@ -446,6 +453,9 @@ impl Control {
                 self.yaw.target_angle_rad += two_pi;
             }
         }
+
+
+
     }
     
     pub fn update(&mut self) {                
@@ -496,6 +506,10 @@ impl Control {
     /// counts it in `TX_FAILED`.
     pub fn transmit(&mut self, can: &mut Can1) {
         let mut data = [0u8; 8];
+
+        // TODO: clamp each voltage count output within the bench limit (protocol +/-25000),
+        // encode signed i16 big-endian and write it into the
+        // bytes for its motor ID as the manual describes. Other motor IDs stay zero.
 
         // yaw
         let yaw_raw = self.yaw.motor.command_voltage_raw.clamp(-MAX_VOLTAGE_RAW, MAX_VOLTAGE_RAW) as i16;
@@ -611,16 +625,42 @@ async fn control_task(mut can: Can1, mut watchdog: dm_mc02::Watchdog) {
     let mut control = Control::default();
     let mut ticker = Ticker::every(TICK);
     let mut last = Instant::now();
+    
+    // 【1】 循环外声明限频计数器
+    let mut log_ticks = 0u16; 
+
     loop {
         ticker.next().await;
-        // After a stall, such as the 20 ms halt when a debug probe attaches, start the
-        // schedule again instead of running every missed tick back to back.
         let now = Instant::now();
         if now - last > TICK * 2 {
             ticker.reset();
         }
         last = now;
+        
         control.tick(&mut can);
         watchdog.pet();
+
+        // 【2】 限频 RTT 日志
+        log_ticks += 1;
+        if log_ticks >= 200 { // 200ms 打印一次
+            log_ticks = 0;
+            
+            // 打印 Yaw 轴 (如果想打印 Pitch，把下面的 yaw 改成 pitch 即可)
+            rtt_target::rprintln!(
+                "state={:?} yaw: angle={:.3} target={:.3} rpm={:.1} target_rpm={:.1} out={:.1} | int_p={:.1} int_s={:.1} stall={} osc_period={}",
+                control.state,
+                control.yaw.motor.angle_rad,
+                control.yaw.target_angle_rad,
+                control.yaw.motor.speed_rpm,
+                control.yaw.target_rpm,
+                control.yaw.motor.command_voltage_raw,
+                
+                // 【3】 任务书要求加的：PID 内部量、堵转计时、振荡周期
+                control.yaw.position_pid.integral,
+                control.yaw.speed_pid.integral,
+                control.yaw.stall_ticks,
+                control.yaw.oscillation_periods
+            );
+        }
     }
 }
