@@ -15,7 +15,7 @@ const MOTOR_COMMAND_ID: u16 = 0x1FF;
 // Ticks without remote input before it counts as lost.
 const REMOTE_SILENT_TICKS: u16 = 100;
 const TICK: Duration = Duration::from_millis(1);
-const MAX_VOLTAGE_RAW: f32 = 10000.0; //【调试】电压最高输出
+const MAX_VOLTAGE_RAW: f32 = 20000.0; //【调试】电压最高输出
 
 /// Command frames dropped because the CAN transmit queue was full, for example while no
 /// motor acknowledges frames.
@@ -153,6 +153,9 @@ pub struct Axis {
     pub max_position_rpm: f32, // rad/s
     pub max_target_rate_rad_s: f32,
     pub rc_deadband: f32,
+
+    //电机转动方向
+    pub direction: f32, 
     
     // 故障检测：疑似堵转
     pub stall_ticks: u16,
@@ -160,6 +163,9 @@ pub struct Axis {
     pub oscillation_ticks: u16,
     pub last_oscillation_sign: i8, // 记录上一次误差符号，用于计算振荡周期
     pub oscillation_periods: u16,  // 累计完整周期的次数
+
+    //摇杆中位
+    pub remote_center: f32,
 }
 
 /// State shared by every control tick.
@@ -177,6 +183,7 @@ pub struct Control {
     pub prepare_timeout_ticks: u16,
     /// 回正稳定计时
     pub prepare_settle_ticks: u16,
+
 }
 
 /// Start in `Waiting` with no remote input.
@@ -186,33 +193,42 @@ impl Default for Control {
 
         // yaw and pitch angle
         let mut yaw = Axis::default();
-        yaw.reference_angle_rad = 0.0; // 【调试】yaw零位 正前方
+        yaw.reference_angle_rad = 2.653; // 【调试】yaw零位 正前方
         yaw.max_position_rpm = 100.0;  // 默认位置环输出限幅，速度环目标最大 100 rpm
         yaw.max_target_rate_rad_s = 2.0;
-        yaw.rc_deadband = 0.05;
-        
-        yaw.position_pid.kp = 10.0;
+        yaw.rc_deadband = 0.1;
+        yaw.remote_center = 0.0; // 【调试】yaw中位
+
+        yaw.position_pid.kp = 300.0;
+        yaw.position_pid.ki = 0.0;
         yaw.position_pid.max_output = 100.0; // 对应 max_position_rpm
         yaw.position_pid.integral_limit = 10.0; // 积分抗饱和，具体数值待调
 
-        yaw.speed_pid.kp = 50.0;
-        yaw.speed_pid.max_output = 5000.0; // 电压原始值限幅 (范围是 -25000~25000)
-        yaw.speed_pid.integral_limit = 1000.0;
+        yaw.speed_pid.kp = 150.0;
+        yaw.speed_pid.ki = 0.0;
+        yaw.speed_pid.kd = 0.0;
+        yaw.speed_pid.max_output = 10000.0; // 电压原始值限幅 (范围是 -25000~25000)
+        yaw.speed_pid.integral_limit = 100.0;
 
         // 配置 pitch 轴 PID 与参考角度
         let mut pitch = Axis::default();
-        pitch.reference_angle_rad = 0.0; // 【调试】pitch零位 水平
+        pitch.reference_angle_rad = 3.12; // 【调试】pitch零位 水平
         pitch.max_position_rpm = 100.0;
         pitch.max_target_rate_rad_s = 2.0;
-        pitch.rc_deadband = 0.05;
-        
-        pitch.position_pid.kp = 10.0;
-        pitch.position_pid.max_output = 100.0;
-        pitch.position_pid.integral_limit = 10.0;
+        pitch.rc_deadband = 0.1;
+        pitch.remote_center = 0.0; // 【调试】pitch中位
 
-        pitch.speed_pid.kp = 50.0;
-        pitch.speed_pid.max_output = 5000.0;
-        pitch.speed_pid.integral_limit = 1000.0;
+        pitch.position_pid.kp = 400.0;
+        pitch.position_pid.ki = 80.0;
+        pitch.position_pid.kd = 2.0;
+        pitch.position_pid.max_output = 300.0;
+        pitch.position_pid.integral_limit = 80.0;
+
+        pitch.speed_pid.kp = 150.0;
+        pitch.speed_pid.ki = 50.0;
+        pitch.speed_pid.kd = 0.0;
+        pitch.speed_pid.max_output = 20000.0;
+        pitch.speed_pid.integral_limit = 400.0;
 
 
         Self {
@@ -357,15 +373,15 @@ impl Control {
                     self.state = State::Error;
                 } else { //右拨杆在3，没有故障，开始计时
                     self.prepare_timeout_ticks += 1;
-                    if self.prepare_timeout_ticks > 3000 { // 3秒超时进error
+                    if self.prepare_timeout_ticks > 5000 { // 3秒超时进error
                         self.state = State::Error;
                         rtt_target::rprintln!("Error: Prepare timeout!");
                     } else {
                         // 【调试】判断两轴是否稳定 (角度误差 < 0.05 rad，速度 < 10 rpm)
                         let yaw_err = Self::wrap_angle(self.yaw.target_angle_rad - self.yaw.motor.angle_rad).abs();
                         let pitch_err = Self::wrap_angle(self.pitch.target_angle_rad - self.pitch.motor.angle_rad).abs();
-                        let yaw_stable = yaw_err < 0.05 && self.yaw.motor.speed_rpm.abs() < 10.0;
-                        let pitch_stable = pitch_err < 0.05 && self.pitch.motor.speed_rpm.abs() < 10.0;
+                        let yaw_stable = yaw_err < 0.1 && self.yaw.motor.speed_rpm.abs() < 10.0;
+                        let pitch_stable = pitch_err < 0.1 && self.pitch.motor.speed_rpm.abs() < 10.0;
                             
                         if yaw_stable && pitch_stable { //两个都稳定
                             self.prepare_settle_ticks += 1;
@@ -394,7 +410,7 @@ impl Control {
 
             State::Error => {
                 // 恢复动作：左拨杆先下拨(2)再上拨(1)
-                if self.last_left_switch == 2 && left_sw == 1 {
+                if self.last_left_switch == 2 && left_sw == 3 {
                     // 恢复动作触发后，重置目标角度和速度环目标
                     self.yaw.target_angle_rad = self.yaw.motor.angle_rad;
                     self.pitch.target_angle_rad = self.pitch.motor.angle_rad;
@@ -426,8 +442,8 @@ impl Control {
         // 放在 Control 的方法中；先读取输入，不在这里直接写电压输出。
         if let Some(remote) = self.remote {
             // 【修复】一定要减去中值 1024！否则摇杆回中也会满速旋转
-            let mut yaw_input = (remote.channels[2] as f32 - 1024.0) / 660.0; //【调试】如果方向反了乘-1
-            let mut pitch_input = (remote.channels[3] as f32 - 1024.0) / 660.0; //【调试】如果方向反了乘-1
+            let mut yaw_input = -(remote.channels[2] as f32 - - self.yaw.remote_center) / 660.0; //【调试】如果方向反了乘-1
+            let mut pitch_input = -(remote.channels[3] as f32 - - self.pitch.remote_center) / 660.0; //【调试】如果方向反了乘-1
             
             yaw_input = yaw_input.clamp(-1.0, 1.0);
             pitch_input = pitch_input.clamp(-1.0, 1.0);
@@ -442,7 +458,10 @@ impl Control {
             self.pitch.target_angle_rad += pitch_input * self.pitch.max_target_rate_rad_s * dt; 
             
             // 限制pitch角度范围 rad
-            self.pitch.target_angle_rad = self.pitch.target_angle_rad.clamp(-0.785, 0.785); 
+            let half = 0.25;  // ±0.25 rad ≈ ±14°，按实际行程调
+            self.pitch.target_angle_rad = self.pitch.target_angle_rad.clamp(
+            self.pitch.reference_angle_rad - half,
+            self.pitch.reference_angle_rad + half,);
             
             //yaw 0~2π回绕
             let two_pi = 2.0 * core::f32::consts::PI;
@@ -468,6 +487,7 @@ impl Control {
             self.read_remote_input(); 
         } 
 
+        
         // --- yaw 双环控制 ---
         // 1. 计算最短路径误差并进行回绕处理
         let yaw_err = Self::wrap_angle(self.yaw.target_angle_rad - self.yaw.motor.angle_rad);
@@ -478,16 +498,17 @@ impl Control {
         
         // 3. 速度环：输入 rpm，输出 电压原始值
         let yaw_voltage = self.yaw.speed_pid.calculate(self.yaw.target_rpm, self.yaw.motor.speed_rpm, 0.001);
-        self.yaw.motor.command_voltage_raw = yaw_voltage;
+        self.yaw.motor.command_voltage_raw = yaw_voltage; //【调试】电机方向
 
         // --- pitch 双环控制 ---
+
         let pitch_err = Self::wrap_angle(self.pitch.target_angle_rad - self.pitch.motor.angle_rad);
         
         let pitch_rpm = self.pitch.position_pid.calculate_from_error(pitch_err, 0.001);
         self.pitch.target_rpm = pitch_rpm.clamp(-self.pitch.max_position_rpm, self.pitch.max_position_rpm);
         
         let pitch_voltage = self.pitch.speed_pid.calculate(self.pitch.target_rpm, self.pitch.motor.speed_rpm, 0.001);
-        self.pitch.motor.command_voltage_raw = pitch_voltage;
+        self.pitch.motor.command_voltage_raw = pitch_voltage;//【调试】电机方向
     }
 
     /// 辅助函数：将角度误差限制在 -π 到 π 之间，解决过零点突变
@@ -644,11 +665,16 @@ async fn control_task(mut can: Can1, mut watchdog: dm_mc02::Watchdog) {
         log_ticks += 1;
         if log_ticks >= 200 { // 200ms 打印一次
             log_ticks = 0;
-            
-            // 打印 Yaw 轴 (如果想打印 Pitch，把下面的 yaw 改成 pitch 即可)
+           
+            let ch2 = control.remote.map_or(0, |r| r.channels[2]);
+            let ch3 = control.remote.map_or(0, |r| r.channels[3]);
+           
+            // 打印
             rtt_target::rprintln!(
-                "state={:?} yaw: angle={:.3} target={:.3} rpm={:.1} target_rpm={:.1} out={:.1} | int_p={:.1} int_s={:.1} stall={} osc_period={}",
+                "state={:?} ch2={} ch3={} |yaw: angle={:.3} target={:.3} rpm={:.1} target_rpm={:.1} out={:.1} | int_p={:.1} int_s={:.1} stall={} osc_period={}",
                 control.state,
+                ch2,
+                ch3,
                 control.yaw.motor.angle_rad,
                 control.yaw.target_angle_rad,
                 control.yaw.motor.speed_rpm,
@@ -660,6 +686,21 @@ async fn control_task(mut can: Can1, mut watchdog: dm_mc02::Watchdog) {
                 control.yaw.speed_pid.integral,
                 control.yaw.stall_ticks,
                 control.yaw.oscillation_periods
+            );
+            rtt_target::rprintln!(
+                "state={:?} ch2={} ch3={} |pitch: angle={:.3} target={:.3} rpm={:.1} target_rpm={:.1} out={:.1} | int_p={:.1} int_s={:.1} stall={} osc_period={}",
+                control.state,
+                ch2,
+                ch3,
+                control.pitch.motor.angle_rad,
+                control.pitch.target_angle_rad,
+                control.pitch.motor.speed_rpm,
+                control.pitch.target_rpm,
+                control.pitch.motor.command_voltage_raw,
+                control.pitch.position_pid.integral,
+                control.pitch.speed_pid.integral,
+                control.pitch.stall_ticks,
+                control.pitch.oscillation_periods
             );
         }
     }
